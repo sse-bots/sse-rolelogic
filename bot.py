@@ -50,6 +50,7 @@ class RoleLogicStore:
         self.db = client[DATABASE_NAME]
         self.logics = self.db.role_logics
         self.managed = self.db.rolelogic_managed_assignments
+        self.autoroles = self.db.rolelogic_autoroles
 
     def initialize(self) -> None:
         self.logics.create_index(
@@ -59,6 +60,19 @@ class RoleLogicStore:
         self.managed.create_index(
             [("guild_id", ASCENDING), ("member_id", ASCENDING), ("role_id", ASCENDING)],
             unique=True,
+        )
+        self.autoroles.create_index([("guild_id", ASCENDING)], unique=True)
+
+    def get_autorole(self, guild_id: int) -> dict[str, Any] | None:
+        return self.autoroles.find_one({"guild_id": str(guild_id)})
+
+    def save_autorole(self, guild_id: int, role_ids: list[int]) -> None:
+        now = utcnow()
+        self.autoroles.update_one(
+            {"guild_id": str(guild_id)},
+            {"$set": {"role_ids": [str(role_id) for role_id in role_ids], "enabled": True, "updated_at": now},
+             "$setOnInsert": {"created_at": now}},
+            upsert=True,
         )
 
     def create_logic(self, document: dict[str, Any]) -> None:
@@ -776,6 +790,7 @@ class RoleLogicBot(commands.Bot):
         self.engine = RoleLogicEngine(self, self.store)
 
         self.tree.add_command(logic_group)
+        self.tree.add_command(autorole_group)
         setup_help(self)
 
         # setup_activation owns global/guild command synchronization.
@@ -794,8 +809,38 @@ class RoleLogicBot(commands.Bot):
             daily_reconciliation.start()
 
     async def on_member_join(self, member: discord.Member) -> None:
+        # Conditional RoleLogic and Autorole are independent. Autorole roles are
+        # deliberately not written to RoleLogic's managed-assignment collection.
         if self.engine:
             await self.engine.reconcile_member(member)
+        if member.bot or not self.store:
+            return
+        try:
+            config = await asyncio.to_thread(self.store.get_autorole, member.guild.id)
+            if not config or not config.get("enabled", True):
+                return
+            me = member.guild.me
+            if me is None:
+                log.warning("Cannot apply Autorole in guild %s: bot member unavailable", member.guild.id)
+                return
+            current_ids = {role.id for role in member.roles}
+            roles: list[discord.Role] = []
+            for raw_id in config.get("role_ids", []):
+                try:
+                    role = member.guild.get_role(int(raw_id))
+                except (TypeError, ValueError):
+                    continue
+                if (role is not None and role.id not in current_ids
+                        and not role.is_default() and not role.managed
+                        and role < me.top_role):
+                    roles.append(role)
+            if roles:
+                await member.add_roles(*roles, reason="SSE RoleLogic Autorole: member joined")
+                log.info("Autorole assigned %s role(s) to member %s in guild %s", len(roles), member.id, member.guild.id)
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Autorole assignment failed for member %s in guild %s", member.id, member.guild.id)
+        except Exception:
+            log.exception("Autorole processing failed for member %s in guild %s", member.id, member.guild.id)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         if self.engine and {role.id for role in before.roles} != {role.id for role in after.roles}:
@@ -807,7 +852,7 @@ class RoleLogicBot(commands.Bot):
         await asyncio.to_thread(
             self.store.logics.update_many,
             {"guild_id": str(role.guild.id)},
-            {"$pull": {"condition_role_ids": role.id}},
+            {"$pull": {"condition_role_ids": {"$in": [role.id, str(role.id)]}}},
         )
         await asyncio.to_thread(
             self.store.logics.delete_many,
@@ -815,7 +860,12 @@ class RoleLogicBot(commands.Bot):
         )
         await asyncio.to_thread(
             self.store.managed.delete_many,
-            {"guild_id": str(role.guild.id), "role_id": role.id},
+            {"guild_id": str(role.guild.id), "role_id": {"$in": [role.id, str(role.id)]}},
+        )
+        await asyncio.to_thread(
+            self.store.autoroles.update_one,
+            {"guild_id": str(role.guild.id)},
+            {"$pull": {"role_ids": str(role.id)}},
         )
         log.info("Cleaned up RoleLogic references for deleted role %s", role.id)
 
@@ -992,6 +1042,264 @@ async def logic_sync(interaction: discord.Interaction) -> None:
     scanned, added, removed = await bot.engine.reconcile_guild(interaction.guild)
     await interaction.followup.send(
         f"**RoleLogic sync complete.**\nMembers checked: **{scanned}**\nRoles assigned: **{added}**\nRoles removed: **{removed}**",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Autorole: independent join-role configuration stored in MongoDB.
+# ---------------------------------------------------------------------------
+autorole_group = app_commands.Group(
+    name="autorole",
+    description="Automatically assign selected roles to new human members",
+)
+
+
+class AutorolePicker(discord.ui.View):
+    PAGE_SIZE = 25
+
+    def __init__(self, guild: discord.Guild, owner_id: int, selected: set[int] | None = None):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.owner_id = owner_id
+        self.selected = set(selected or set())
+        self.page = 0
+        self.message: discord.InteractionMessage | None = None
+        self._build()
+
+    def _roles(self) -> list[discord.Role]:
+        me = self.guild.me
+        if me is None:
+            return []
+        return sorted(
+            (role for role in self.guild.roles
+             if not role.is_default() and not role.managed and role < me.top_role),
+            key=lambda role: (role.position, role.name.casefold()),
+            reverse=True,
+        )
+
+    def _build(self) -> None:
+        self.clear_items()
+        roles = self._roles()
+        pages = max(1, (len(roles) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(self.page, pages - 1))
+        page_roles = roles[self.page * self.PAGE_SIZE:(self.page + 1) * self.PAGE_SIZE]
+        if page_roles:
+            options = [
+                discord.SelectOption(
+                    label=discord.utils.escape_markdown(role.name)[:100] or "Unnamed role",
+                    value=str(role.id),
+                    default=role.id in self.selected,
+                )
+                for role in page_roles
+            ]
+            self.add_item(AutoroleRoleSelect(options, self))
+        if pages > 1:
+            self.add_item(AutorolePageButton(self, -1, self.page == 0))
+            self.add_item(AutorolePageButton(self, 1, self.page >= pages - 1))
+        self.add_item(AutoroleSaveButton(self))
+        self.add_item(AutoroleCancelButton())
+
+    def embed(self) -> discord.Embed:
+        roles = self._roles()
+        pages = max(1, (len(roles) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        selected_roles = [self.guild.get_role(role_id) for role_id in sorted(self.selected)]
+        selected_text = ", ".join(role.mention for role in selected_roles if role) or "None"
+        if len(selected_text) > 2500:
+            selected_text = selected_text[:2450] + "…"
+        embed = discord.Embed(
+            title="SSE RoleLogic · Autorole setup",
+            description=(
+                "Choose the roles to give automatically to new human members. "
+                "Selections are preserved when you change pages.\n\n"
+                f"**Selected ({len(self.selected)}):** {selected_text}\n\n"
+                f"**Available assignable roles:** {len(roles)}"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"Page {self.page + 1}/{pages} · Only roles below the bot's highest role are listed")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This Autorole setup belongs to another administrator.", ephemeral=True)
+            return False
+        return True
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        self._build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
+class AutoroleRoleSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption], parent: AutorolePicker):
+        super().__init__(
+            placeholder="Select roles for new members",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=0,
+        )
+        self.parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        page_roles = self.parent._roles()[self.parent.page * self.parent.PAGE_SIZE:(self.parent.page + 1) * self.parent.PAGE_SIZE]
+        page_ids = {role.id for role in page_roles}
+        self.parent.selected.difference_update(page_ids)
+        self.parent.selected.update(int(value) for value in self.values)
+        await self.parent.refresh(interaction)
+
+
+class AutorolePageButton(discord.ui.Button):
+    def __init__(self, parent: AutorolePicker, delta: int, disabled: bool):
+        super().__init__(
+            label="Previous" if delta < 0 else "Next",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+            row=1,
+        )
+        self.parent = parent
+        self.delta = delta
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent.page += self.delta
+        await self.parent.refresh(interaction)
+
+
+class AutoroleSaveButton(discord.ui.Button):
+    def __init__(self, parent: AutorolePicker):
+        super().__init__(label="Save Autorole", style=discord.ButtonStyle.success, row=2)
+        self.parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not self.parent.selected:
+            await interaction.response.send_message("Select at least one role before saving.", ephemeral=True)
+            return
+        # Revalidate against current server roles; roles may have changed while the UI was open.
+        valid = {role.id for role in self.parent._roles()}
+        invalid = self.parent.selected - valid
+        if invalid:
+            await interaction.response.send_message(
+                "One or more selected roles are no longer assignable. Reopen setup and select valid roles.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await asyncio.to_thread(bot.store.save_autorole, self.parent.guild.id, sorted(self.parent.selected))
+        except PyMongoError:
+            log.exception("Failed to save Autorole configuration for guild %s", self.parent.guild.id)
+            await interaction.response.send_message("I couldn't save Autorole right now. Please try again.", ephemeral=True)
+            return
+        self.parent.stop()
+        await interaction.response.edit_message(
+            content=f"✅ Autorole enabled. **{len(self.parent.selected)}** role(s) will be assigned to new human members.",
+            embed=None,
+            view=None,
+        )
+
+
+class AutoroleCancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.danger, row=2)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.view.stop()
+        await interaction.response.edit_message(content="Autorole setup cancelled.", embed=None, view=None)
+
+
+async def _open_autorole_picker(interaction: discord.Interaction, existing: dict[str, Any] | None) -> None:
+    selected: set[int] = set()
+    if existing:
+        for raw_id in existing.get("role_ids", []):
+            try:
+                selected.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+    view = AutorolePicker(interaction.guild, interaction.user.id, selected)
+    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+
+@autorole_group.command(name="setup", description="Set up roles to assign when new members join.")
+@admin_only()
+async def autorole_setup(interaction: discord.Interaction) -> None:
+    existing = await asyncio.to_thread(bot.store.get_autorole, interaction.guild.id)
+    await _open_autorole_picker(interaction, existing)
+
+
+@autorole_group.command(name="edit", description="Edit the roles assigned to new members.")
+@admin_only()
+async def autorole_edit(interaction: discord.Interaction) -> None:
+    existing = await asyncio.to_thread(bot.store.get_autorole, interaction.guild.id)
+    if not existing:
+        await interaction.response.send_message("Autorole is not set up. Use `/autorole setup` first.", ephemeral=True)
+        return
+    await _open_autorole_picker(interaction, existing)
+
+
+@autorole_group.command(name="status", description="View this server's Autorole configuration.")
+@admin_only()
+async def autorole_status(interaction: discord.Interaction) -> None:
+    config = await asyncio.to_thread(bot.store.get_autorole, interaction.guild.id)
+    if not config:
+        await interaction.response.send_message("Autorole is not configured. Use `/autorole setup`.", ephemeral=True)
+        return
+    roles = []
+    for raw_id in config.get("role_ids", []):
+        try:
+            role = interaction.guild.get_role(int(raw_id))
+        except (TypeError, ValueError):
+            role = None
+        if role:
+            roles.append(role)
+    embed = discord.Embed(
+        title="SSE RoleLogic · Autorole status",
+        description=(
+            f"**Status:** {'Enabled' if config.get('enabled', True) else 'Disabled'}\n"
+            f"**Roles ({len(roles)}):** {', '.join(role.mention for role in roles) or 'No valid roles'}\n"
+            "**Applies to:** New human members"
+        ),
+        color=discord.Color.green() if config.get("enabled", True) else discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@autorole_group.command(name="enable", description="Enable configured Autorole assignments.")
+@admin_only()
+async def autorole_enable(interaction: discord.Interaction) -> None:
+    result = await asyncio.to_thread(
+        bot.store.autoroles.update_one,
+        {"guild_id": str(interaction.guild.id), "role_ids": {"$exists": True, "$ne": []}},
+        {"$set": {"enabled": True, "updated_at": utcnow()}},
+    )
+    await interaction.response.send_message(
+        "Autorole enabled for new members." if result.matched_count else "Autorole is not configured. Use `/autorole setup`.",
+        ephemeral=True,
+    )
+
+
+@autorole_group.command(name="disable", description="Temporarily disable Autorole without deleting its settings.")
+@admin_only()
+async def autorole_disable(interaction: discord.Interaction) -> None:
+    result = await asyncio.to_thread(
+        bot.store.autoroles.update_one,
+        {"guild_id": str(interaction.guild.id)},
+        {"$set": {"enabled": False, "updated_at": utcnow()}},
+    )
+    await interaction.response.send_message(
+        "Autorole disabled. Existing member roles will not be removed." if result.matched_count else "Autorole is not configured.",
+        ephemeral=True,
+    )
+
+
+@autorole_group.command(name="remove", description="Permanently remove this server's Autorole configuration.")
+@admin_only()
+async def autorole_remove(interaction: discord.Interaction) -> None:
+    result = await asyncio.to_thread(
+        bot.store.autoroles.delete_one,
+        {"guild_id": str(interaction.guild.id)},
+    )
+    await interaction.response.send_message(
+        "Autorole configuration removed. Existing member roles have been left unchanged." if result.deleted_count else "Autorole is not configured.",
         ephemeral=True,
     )
 

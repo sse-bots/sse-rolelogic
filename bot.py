@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -234,50 +235,176 @@ class RoleLogicEngine:
                 log.exception("Guild reconciliation failed for %s", guild.id)
 
 
-class NameModal(discord.ui.Modal):
-    def __init__(self, wizard: "LogicWizard", existing: dict[str, Any] | None = None):
-        super().__init__(title="Edit RoleLogic" if existing else "Create RoleLogic")
-        self.wizard = wizard
-        self.existing = existing
-        self.logic_name = discord.ui.TextInput(
-            label="Logic name",
-            placeholder="e.g. SSE Staff Assignment",
-            max_length=70,
-            required=True,
-            default=existing.get("name") if existing else None,
-        )
-        self.add_item(self.logic_name)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.wizard.name = str(self.logic_name.value).strip()
-        await interaction.response.send_message(
-            "**Step 2/4 — Choose the role to assign**\n"
-            "Select the role RoleLogic should automatically give members.",
-            view=TargetRoleView(self.wizard),
-            ephemeral=True,
-        )
-
 
 class LogicWizard:
+    """Single-message, user-bound RoleLogic editor."""
+
+    PAGE_SIZE = 25
+    TIMEOUT = 600
+
     def __init__(
         self,
         bot: "RoleLogicBot",
         guild: discord.Guild,
         owner_id: int,
+        name: str,
         existing: dict[str, Any] | None = None,
     ):
         self.bot = bot
         self.guild = guild
         self.owner_id = owner_id
         self.existing = existing
-        self.name = existing.get("name", "") if existing else ""
-        self.target_role_id: int | None = None
-        self.operator = "OR"
-        self.condition_role_ids: list[int] = []
+        self.name = name.strip()
+        self.target_role_id: int | None = (
+            int(existing["target_role_id"]) if existing else None
+        )
+        self.operator = existing.get("operator", "OR") if existing else "OR"
+        self.condition_role_ids: set[int] = (
+            {int(value) for value in existing.get("condition_role_ids", [])}
+            if existing else set()
+        )
+        self.step = 0
+        self.target_page = 0
+        self.condition_page = 0
+        self.message: discord.WebhookMessage | None = None
+        self.active_view: LogicWizardView | None = None
+        self.completed = False
+        self.expires_at = time.monotonic() + 14 * 60
+
+    def _eligible_roles(self, *, target: bool = False) -> list[discord.Role]:
+        roles = [
+            role for role in self.guild.roles
+            if not role.is_default() and not role.managed
+        ]
+        if target:
+            me = self.guild.me
+            if me is None:
+                return []
+            roles = [role for role in roles if role < me.top_role]
+        return sorted(roles, key=lambda role: (role.position, role.name.casefold()))
+
+    def _page_roles(self, *, target: bool = False) -> list[discord.Role]:
+        roles = self._eligible_roles(target=target)
+        page = self.target_page if target else self.condition_page
+        pages = max(1, (len(roles) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        if target:
+            self.target_page = page
+        else:
+            self.condition_page = page
+        return roles[page * self.PAGE_SIZE:(page + 1) * self.PAGE_SIZE]
+
+    @staticmethod
+    def _role_label(role: discord.Role) -> str:
+        return discord.utils.escape_markdown(role.name)[:100]
+
+    def _embed(self) -> discord.Embed:
+        target = self.guild.get_role(self.target_role_id or 0)
+        conditions = [
+            self.guild.get_role(role_id)
+            for role_id in sorted(self.condition_role_ids)
+        ]
+        conditions = [role for role in conditions if role is not None]
+
+        embed = discord.Embed(
+            title=f"{'Edit' if self.existing else 'Create'} RoleLogic: {self.name}",
+            color=discord.Color.blurple(),
+        )
+        if self.step == 0:
+            roles = self._eligible_roles(target=True)
+            pages = max(1, (len(roles) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+            embed.description = (
+                "**Step 1/4 — Target role**\n"
+                "Choose the role the bot should assign automatically.\n\n"
+                f"Currently selected: {target.mention if target else 'None'}\n"
+                f"Available assignable roles: {len(roles)}"
+            )
+            embed.set_footer(text=f"Role page {self.target_page + 1}/{pages}")
+        elif self.step == 1:
+            embed.description = (
+                "**Step 2/4 — Condition type**\n"
+                "Choose how condition roles are evaluated.\n\n"
+                "**OR:** at least one selected role is required.\n"
+                "**AND:** every selected role is required.\n\n"
+                f"Current selection: **{self.operator}**"
+            )
+        elif self.step == 2:
+            roles = self._eligible_roles()
+            pages = max(1, (len(roles) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+            selected = [
+                self.guild.get_role(role_id)
+                for role_id in sorted(self.condition_role_ids)
+            ]
+            selected = [role for role in selected if role is not None]
+            selected_text = ", ".join(role.mention for role in selected) or "None"
+            # Keep the ephemeral embed within Discord's 4096-character description limit.
+            if len(selected_text) > 2500:
+                selected_text = selected_text[:2450] + "…"
+            embed.description = (
+                "**Step 3/4 — Condition roles**\n"
+                "Use the role menu to add or remove one role at a time. "
+                "Change pages without losing your selections.\n\n"
+                f"**Selected ({len(self.condition_role_ids)}):** {selected_text}\n\n"
+                f"**Rule:** {self.operator} · **Available roles:** {len(roles)}"
+            )
+            embed.set_footer(text=f"Role page {self.condition_page + 1}/{pages}")
+        else:
+            selected = [
+                self.guild.get_role(role_id)
+                for role_id in sorted(self.condition_role_ids)
+            ]
+            selected = [role for role in selected if role is not None]
+            selected_text = ", ".join(role.mention for role in selected) or "None"
+            if len(selected_text) > 2500:
+                selected_text = selected_text[:2450] + "…"
+            embed.title = "Review RoleLogic"
+            embed.description = (
+                f"**Name:** {discord.utils.escape_markdown(self.name)}\n"
+                f"**Assign role:** {target.mention if target else 'Unavailable'}\n"
+                f"**Condition:** **{self.operator}**\n"
+                f"**Selected condition roles ({len(self.condition_role_ids)}):** "
+                f"{selected_text}\n\n"
+                "Press **Save** to apply this logic, or **Back** to make changes."
+            )
+        return embed
+
+    def build_view(self) -> "LogicWizardView":
+        if self.active_view is not None:
+            self.active_view.stop()
+        self.active_view = LogicWizardView(self)
+        return self.active_view
+
+    async def start(self, interaction: discord.Interaction) -> None:
+        view = self.build_view()
+        await interaction.response.send_message(
+            embed=self._embed(),
+            view=view,
+            ephemeral=True,
+        )
+        try:
+            self.message = await interaction.original_response()
+        except discord.HTTPException:
+            log.warning("Could not cache RoleLogic wizard message for user %s", self.owner_id)
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            embed=self._embed(),
+            view=self.build_view(),
+        )
+
+    async def _show_error(self, interaction: discord.Interaction, message: str) -> None:
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="Cannot save RoleLogic",
+                description=message + "\n\nYour selections are still available; correct the issue and try again.",
+                color=discord.Color.orange(),
+            ),
+            view=self.build_view(),
+        )
 
     async def save(self, interaction: discord.Interaction) -> None:
         if not self.name:
-            return await interaction.response.send_message("A logic name is required.", ephemeral=True)
+            return await self._show_error(interaction, "A logic name is required.")
 
         name_key = self.name.casefold().strip()
         existing_same_name = await asyncio.to_thread(
@@ -286,19 +413,38 @@ class LogicWizard:
         if existing_same_name and (
             not self.existing or existing_same_name["_id"] != self.existing["_id"]
         ):
-            return await interaction.response.send_message(
-                "A logic with that name already exists in this server.", ephemeral=True
+            return await self._show_error(
+                interaction, "A logic with that name already exists in this server."
             )
 
         target = self.guild.get_role(int(self.target_role_id or 0))
         if target is None or target.is_default() or target.managed:
-            return await interaction.response.send_message("That target role is no longer available.", ephemeral=True)
+            return await self._show_error(
+                interaction, "That target role is no longer available."
+            )
         if self.guild.me is None or target >= self.guild.me.top_role:
-            return await interaction.response.send_message(
+            return await self._show_error(
+                interaction,
                 "I cannot manage that role. Move my bot role above the target role and try again.",
-                ephemeral=True,
+            )
+        if not self.condition_role_ids:
+            return await self._show_error(
+                interaction, "Select at least one condition role before saving."
             )
 
+        # Drop roles that were deleted while the wizard was open.
+        valid_condition_ids = {
+            role_id for role_id in self.condition_role_ids
+            if (role := self.guild.get_role(role_id)) is not None
+            and not role.is_default()
+            and not role.managed
+        }
+        if not valid_condition_ids:
+            return await self._show_error(
+                interaction, "None of the selected condition roles are available anymore."
+            )
+
+        now = utcnow()
         document = {
             "_id": self.existing["_id"] if self.existing else uuid.uuid4().hex,
             "guild_id": str(self.guild.id),
@@ -306,75 +452,121 @@ class LogicWizard:
             "name_key": name_key,
             "target_role_id": int(self.target_role_id),
             "operator": self.operator,
-            "condition_role_ids": [int(value) for value in self.condition_role_ids],
+            "condition_role_ids": sorted(valid_condition_ids),
             "enabled": self.existing.get("enabled", True) if self.existing else True,
-            "created_by": self.existing.get("created_by", str(self.owner_id)) if self.existing else str(self.owner_id),
-            "created_at": self.existing.get("created_at", utcnow()) if self.existing else utcnow(),
-            "updated_at": utcnow(),
+            "created_by": (
+                self.existing.get("created_by", str(self.owner_id))
+                if self.existing else str(self.owner_id)
+            ),
+            "created_at": self.existing.get("created_at", now) if self.existing else now,
+            "updated_at": now,
         }
         try:
             if self.existing:
                 update_fields = {key: value for key, value in document.items() if key != "_id"}
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     self.bot.store.logics.update_one,
                     {"_id": self.existing["_id"], "guild_id": str(self.guild.id)},
                     {"$set": update_fields},
                 )
+                if result.matched_count == 0:
+                    return await self._show_error(
+                        interaction,
+                        "This logic no longer exists. Reopen the editor and try again.",
+                    )
             else:
                 await asyncio.to_thread(self.bot.store.create_logic, document)
         except DuplicateKeyError:
-            return await interaction.response.send_message(
-                "A logic with that name already exists.", ephemeral=True
+            return await self._show_error(
+                interaction, "A logic with that name already exists."
             )
         except PyMongoError:
             log.exception("Could not save RoleLogic")
-            return await interaction.response.send_message(
-                "Database error while saving this logic. Please try again.", ephemeral=True
+            return await self._show_error(
+                interaction, "Database error while saving this logic. Please try again."
             )
 
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="RoleLogic saved",
-                description=(
-                    f"**{discord.utils.escape_markdown(self.name)}** is now "
-                    f"{'updated' if self.existing else 'created'}.\n\n"
-                    f"**Assign:** {target.mention}\n"
-                    f"**Condition:** {'ALL' if self.operator == 'AND' else 'ANY'} of "
-                    f"{len(self.condition_role_ids)} selected roles"
-                ),
-                color=discord.Color.green(),
+        self.completed = True
+        self.condition_role_ids = valid_condition_ids
+        success = discord.Embed(
+            title="RoleLogic saved",
+            description=(
+                f"**{discord.utils.escape_markdown(self.name)}** was "
+                f"{'updated' if self.existing else 'created'} successfully.\n\n"
+                f"**Assign:** {target.mention}\n"
+                f"**Condition:** {'ALL' if self.operator == 'AND' else 'ANY'} of "
+                f"{len(valid_condition_ids)} selected roles"
             ),
-            ephemeral=True,
+            color=discord.Color.green(),
         )
+        await interaction.response.edit_message(embed=success, content=None, view=None)
         await self.bot.engine.reconcile_guild(self.guild)
 
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        self.completed = True
+        await interaction.response.edit_message(
+            content="RoleLogic setup cancelled.",
+            embed=None,
+            view=None,
+        )
 
-class TargetRoleView(discord.ui.View):
+
+class WizardRoleSelect(discord.ui.Select):
     def __init__(self, wizard: LogicWizard):
-        super().__init__(timeout=300)
         self.wizard = wizard
-        self.add_item(TargetRoleSelect(wizard))
-
-
-class TargetRoleSelect(discord.ui.RoleSelect):
-    def __init__(self, wizard: LogicWizard):
-        super().__init__(placeholder="Select the role to assign", min_values=1, max_values=1)
-        self.wizard = wizard
+        is_target = wizard.step == 0
+        roles = wizard._page_roles(target=is_target)
+        selected_ids = (
+            {wizard.target_role_id} if is_target and wizard.target_role_id else
+            wizard.condition_role_ids if not is_target else set()
+        )
+        options = [
+            discord.SelectOption(
+                label=wizard._role_label(role),
+                value=str(role.id),
+                description=("Selected" if role.id in selected_ids else "Click to select"),
+                default=role.id in selected_ids,
+            )
+            for role in roles
+        ]
+        super().__init__(
+            placeholder=(
+                "Choose the target role"
+                if is_target else "Toggle a condition role on/off"
+            ),
+            min_values=1,
+            max_values=1,
+            options=options or [
+                discord.SelectOption(label="No eligible roles available", value="none")
+            ],
+            disabled=not bool(roles),
+            row=0,
+        )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.wizard.owner_id:
-            return await interaction.response.send_message("This setup belongs to another administrator.", ephemeral=True)
-        self.wizard.target_role_id = self.values[0].id
-        await interaction.response.send_message(
-            "**Step 3/4 — Choose the condition type**\n"
-            "OR = member needs at least one selected role.\n"
-            "AND = member needs every selected role.",
-            view=OperatorView(self.wizard),
-            ephemeral=True,
-        )
+            return await interaction.response.send_message(
+                "This setup belongs to another administrator.", ephemeral=True
+            )
+        if self.wizard.completed:
+            return await interaction.response.send_message(
+                "This wizard has already finished.", ephemeral=True
+            )
+        value = self.values[0]
+        if value == "none":
+            return await interaction.response.defer()
+        role_id = int(value)
+        if self.wizard.step == 0:
+            self.wizard.target_role_id = role_id
+        elif self.wizard.step == 2:
+            if role_id in self.wizard.condition_role_ids:
+                self.wizard.condition_role_ids.remove(role_id)
+            else:
+                self.wizard.condition_role_ids.add(role_id)
+        await self.wizard.refresh(interaction)
 
 
-class OperatorSelect(discord.ui.Select):
+class WizardOperatorSelect(discord.ui.Select):
     def __init__(self, wizard: LogicWizard):
         self.wizard = wizard
         super().__init__(
@@ -382,92 +574,162 @@ class OperatorSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label="OR — Any selected role", value="OR", description="At least one condition role is required"),
-                discord.SelectOption(label="AND — All selected roles", value="AND", description="Every condition role is required"),
+                discord.SelectOption(
+                    label="OR — Any selected role",
+                    value="OR",
+                    description="At least one condition role is required",
+                    default=wizard.operator == "OR",
+                ),
+                discord.SelectOption(
+                    label="AND — All selected roles",
+                    value="AND",
+                    description="Every condition role is required",
+                    default=wizard.operator == "AND",
+                ),
             ],
+            row=0,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.wizard.owner_id:
-            return await interaction.response.send_message("This setup belongs to another administrator.", ephemeral=True)
+            return await interaction.response.send_message(
+                "This setup belongs to another administrator.", ephemeral=True
+            )
         self.wizard.operator = self.values[0]
-        await interaction.response.send_message(
-            "**Step 4/4 — Select condition roles**\n"
-            "Choose one or more roles. Members matching the selected OR/AND rule will receive the target role.",
-            view=ConditionRolesView(self.wizard),
-            ephemeral=True,
-        )
+        await self.wizard.refresh(interaction)
 
 
-class OperatorView(discord.ui.View):
-    def __init__(self, wizard: LogicWizard):
-        super().__init__(timeout=300)
-        self.add_item(OperatorSelect(wizard))
-
-
-class ConditionRolesView(discord.ui.View):
-    def __init__(self, wizard: LogicWizard):
-        super().__init__(timeout=300)
-        self.add_item(ConditionRoleSelect(wizard))
-
-
-class ConditionRoleSelect(discord.ui.RoleSelect):
-    def __init__(self, wizard: LogicWizard):
-        super().__init__(
-            placeholder="Select one or more condition roles",
-            min_values=1,
-            max_values=25,
-        )
+class WizardButton(discord.ui.Button):
+    def __init__(self, wizard: LogicWizard, action: str, **kwargs: Any):
+        super().__init__(**kwargs)
         self.wizard = wizard
+        self.action = action
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.wizard.owner_id:
-            return await interaction.response.send_message("This setup belongs to another administrator.", ephemeral=True)
-        self.wizard.condition_role_ids = [role.id for role in self.values]
-        target = self.wizard.guild.get_role(int(self.wizard.target_role_id or 0))
-        conditions = [self.wizard.guild.get_role(role_id) for role_id in self.wizard.condition_role_ids]
-        condition_text = ", ".join(role.mention for role in conditions if role) or "Unavailable roles"
-        embed = discord.Embed(
-            title="Confirm RoleLogic",
-            description=(
-                f"**Name:** {discord.utils.escape_markdown(self.wizard.name)}\n"
-                f"**Assign role:** {target.mention if target else 'Unavailable'}\n"
-                f"**Condition:** {self.wizard.operator}\n"
-                f"**Required roles:** {condition_text}"
-            ),
-            color=discord.Color.blurple(),
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            view=ConfirmLogicView(self.wizard),
-            ephemeral=True,
-        )
+        wizard = self.wizard
+        if interaction.user.id != wizard.owner_id:
+            return await interaction.response.send_message(
+                "This setup belongs to another administrator.", ephemeral=True
+            )
+        if wizard.completed:
+            return await interaction.response.send_message(
+                "This wizard has already finished.", ephemeral=True
+            )
+
+        if self.action == "target_prev":
+            wizard.target_page = max(0, wizard.target_page - 1)
+        elif self.action == "target_next":
+            roles = wizard._eligible_roles(target=True)
+            pages = max(1, (len(roles) + wizard.PAGE_SIZE - 1) // wizard.PAGE_SIZE)
+            wizard.target_page = min(pages - 1, wizard.target_page + 1)
+        elif self.action == "condition_prev":
+            wizard.condition_page = max(0, wizard.condition_page - 1)
+        elif self.action == "condition_next":
+            roles = wizard._eligible_roles()
+            pages = max(1, (len(roles) + wizard.PAGE_SIZE - 1) // wizard.PAGE_SIZE)
+            wizard.condition_page = min(pages - 1, wizard.condition_page + 1)
+        elif self.action == "back":
+            wizard.step = max(0, wizard.step - 1)
+        elif self.action == "next":
+            if wizard.step == 0 and not wizard.target_role_id:
+                return await interaction.response.send_message(
+                    "Choose a target role first.", ephemeral=True
+                )
+            wizard.step = min(3, wizard.step + 1)
+        elif self.action == "review":
+            if not wizard.condition_role_ids:
+                return await interaction.response.send_message(
+                    "Select at least one condition role before reviewing.",
+                    ephemeral=True,
+                )
+            wizard.step = 3
+        elif self.action == "save":
+            return await wizard.save(interaction)
+        elif self.action == "cancel":
+            return await wizard.cancel(interaction)
+        await wizard.refresh(interaction)
 
 
-class ConfirmLogicView(discord.ui.View):
+class LogicWizardView(discord.ui.View):
     def __init__(self, wizard: LogicWizard):
-        super().__init__(timeout=300)
+        super().__init__(timeout=max(1.0, wizard.expires_at - time.monotonic()))
         self.wizard = wizard
 
-    @discord.ui.button(label="Save logic", style=discord.ButtonStyle.success, emoji="💾")
-    async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.user.id != self.wizard.owner_id:
-            return await interaction.response.send_message("This setup belongs to another administrator.", ephemeral=True)
-        await self.wizard.save(interaction)
+        if wizard.step in (0, 2):
+            self.add_item(WizardRoleSelect(wizard))
+        elif wizard.step == 1:
+            self.add_item(WizardOperatorSelect(wizard))
+
+        if wizard.step == 0:
+            roles = wizard._eligible_roles(target=True)
+            pages = max(1, (len(roles) + wizard.PAGE_SIZE - 1) // wizard.PAGE_SIZE)
+            self.add_item(WizardButton(
+                wizard, "target_prev", label="Previous roles",
+                style=discord.ButtonStyle.secondary, row=1,
+                disabled=wizard.target_page <= 0,
+            ))
+            self.add_item(WizardButton(
+                wizard, "target_next", label="More roles",
+                style=discord.ButtonStyle.secondary, row=1,
+                disabled=wizard.target_page >= pages - 1,
+            ))
+        elif wizard.step == 2:
+            roles = wizard._eligible_roles()
+            pages = max(1, (len(roles) + wizard.PAGE_SIZE - 1) // wizard.PAGE_SIZE)
+            self.add_item(WizardButton(
+                wizard, "condition_prev", label="Previous roles",
+                style=discord.ButtonStyle.secondary, row=1,
+                disabled=wizard.condition_page <= 0,
+            ))
+            self.add_item(WizardButton(
+                wizard, "condition_next", label="More roles",
+                style=discord.ButtonStyle.secondary, row=1,
+                disabled=wizard.condition_page >= pages - 1,
+            ))
+
+        if wizard.step > 0:
+            self.add_item(WizardButton(
+                wizard, "back", label="Back",
+                style=discord.ButtonStyle.secondary, row=2,
+            ))
+        if wizard.step in (0, 1):
+            self.add_item(WizardButton(
+                wizard, "next", label="Next",
+                style=discord.ButtonStyle.primary, row=2,
+                disabled=(wizard.step == 0 and wizard.target_role_id is None),
+            ))
+        elif wizard.step == 2:
+            self.add_item(WizardButton(
+                wizard, "review", label="Review",
+                style=discord.ButtonStyle.primary, row=2,
+                disabled=not bool(wizard.condition_role_ids),
+            ))
+        elif wizard.step == 3:
+            self.add_item(WizardButton(
+                wizard, "save", label="Save",
+                style=discord.ButtonStyle.success, emoji="💾", row=2,
+            ))
+
+        self.add_item(WizardButton(
+            wizard, "cancel", label="Cancel",
+            style=discord.ButtonStyle.danger, row=2,
+        ))
+
+    async def on_timeout(self) -> None:
+        if self.wizard.completed:
+            return
+        self.wizard.completed = True
         for item in self.children:
             item.disabled = True
         try:
-            await interaction.edit_original_response(view=self)
-        except discord.HTTPException:
-            pass
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.user.id != self.wizard.owner_id:
-            return await interaction.response.send_message("This setup belongs to another administrator.", ephemeral=True)
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content="RoleLogic setup cancelled.", embed=None, view=self)
+            if self.wizard.message:
+                await self.wizard.message.edit(
+                    content="This RoleLogic setup expired. Run the command again to restart.",
+                    embed=None,
+                    view=self,
+                )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            log.debug("Could not update expired RoleLogic wizard message")
 
 
 logic_group = app_commands.Group(name="logic", description="Create and manage automatic role-assignment logics")
@@ -566,23 +828,76 @@ class RoleLogicBot(commands.Bot):
 bot = RoleLogicBot()
 
 
+
+async def _logic_name_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild is None or bot.store is None:
+        return []
+    try:
+        documents = await asyncio.to_thread(bot.store.list_logics, interaction.guild.id)
+    except PyMongoError:
+        log.exception("Could not load logic names for autocomplete")
+        return []
+    query = (current or "").casefold().strip()
+    matches = [
+        doc for doc in documents
+        if query in str(doc.get("name", "")).casefold()
+    ]
+    return [
+        app_commands.Choice(name=str(doc["name"])[:100], value=str(doc["name"])[:100])
+        for doc in matches[:25]
+    ]
+
+
 @logic_group.command(name="create", description="Create a new automatic role-assignment logic.")
+@app_commands.describe(name="A unique name for this logic.")
 @admin_only()
-async def logic_create(interaction: discord.Interaction) -> None:
-    wizard = LogicWizard(bot, interaction.guild, interaction.user.id)
-    await interaction.response.send_modal(NameModal(wizard))
+async def logic_create(interaction: discord.Interaction, name: str) -> None:
+    name = name.strip()
+    if not name or len(name) > 70:
+        return await interaction.response.send_message(
+            "Logic names must contain between 1 and 70 characters.",
+            ephemeral=True,
+        )
+    if await asyncio.to_thread(bot.store.get_logic, interaction.guild.id, name):
+        return await interaction.response.send_message(
+            "A logic with that name already exists in this server.",
+            ephemeral=True,
+        )
+    wizard = LogicWizard(bot, interaction.guild, interaction.user.id, name)
+    await wizard.start(interaction)
+
+
+@logic_create.autocomplete("name")
+async def logic_create_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return await _logic_name_autocomplete(interaction, current)
 
 
 @logic_group.command(name="edit", description="Edit an existing role-assignment logic.")
-@app_commands.describe(name="The exact name of the logic you want to edit.")
+@app_commands.describe(name="Choose the logic you want to edit.")
 @admin_only()
 async def logic_edit(interaction: discord.Interaction, name: str) -> None:
     document = await asyncio.to_thread(bot.store.get_logic, interaction.guild.id, name)
     if not document:
-        return await interaction.response.send_message("I couldn't find a logic with that name.", ephemeral=True)
-    wizard = LogicWizard(bot, interaction.guild, interaction.user.id, existing=document)
-    await interaction.response.send_modal(NameModal(wizard, existing=document))
+        return await interaction.response.send_message(
+            "I couldn't find a logic with that name.", ephemeral=True
+        )
+    wizard = LogicWizard(
+        bot, interaction.guild, interaction.user.id,
+        document["name"], existing=document,
+    )
+    await wizard.start(interaction)
 
+
+@logic_edit.autocomplete("name")
+async def logic_edit_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return await _logic_name_autocomplete(interaction, current)
 
 @logic_group.command(name="list", description="Show all RoleLogic rules in this server.")
 @admin_only()
@@ -622,6 +937,14 @@ async def logic_delete(interaction: discord.Interaction, name: str) -> None:
     await bot.engine.reconcile_guild(interaction.guild)
 
 
+
+@logic_delete.autocomplete("name")
+async def logic_delete_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return await _logic_name_autocomplete(interaction, current)
+
+
 @logic_group.command(name="pause", description="Pause a RoleLogic rule without deleting it.")
 @app_commands.describe(name="The exact name of the logic to pause.")
 @admin_only()
@@ -634,6 +957,14 @@ async def logic_pause(interaction: discord.Interaction, name: str) -> None:
     await bot.engine.reconcile_guild(interaction.guild)
 
 
+
+@logic_pause.autocomplete("name")
+async def logic_pause_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return await _logic_name_autocomplete(interaction, current)
+
+
 @logic_group.command(name="resume", description="Resume a paused RoleLogic rule.")
 @app_commands.describe(name="The exact name of the logic to resume.")
 @admin_only()
@@ -644,6 +975,14 @@ async def logic_resume(interaction: discord.Interaction, name: str) -> None:
     await asyncio.to_thread(bot.store.update_logic, document["_id"], interaction.guild.id, {"enabled": True})
     await interaction.response.send_message(f"Resumed **{discord.utils.escape_markdown(document['name'])}**.", ephemeral=True)
     await bot.engine.reconcile_guild(interaction.guild)
+
+
+
+@logic_resume.autocomplete("name")
+async def logic_resume_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return await _logic_name_autocomplete(interaction, current)
 
 
 @logic_group.command(name="sync", description="Immediately scan this server and apply all active RoleLogic rules.")

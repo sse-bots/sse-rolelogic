@@ -198,21 +198,21 @@ def _bot_avatar(bot: Any) -> str | None:
     return getattr(avatar, "url", None)
 
 
-def _registered_commands(bot: Any) -> list[Any]:
-    """Read commands currently registered on this bot's local command tree."""
-    commands = list(bot.tree.get_commands())
-    # Include guild-scoped commands too, without duplicating names already found.
-    seen = {(getattr(command, "name", ""), getattr(command, "type", None)) for command in commands}
-    for guild in getattr(bot, "guilds", []):
+def _registered_commands(bot: Any, guild_id: int | None = None) -> list[Any]:
+    """Return only commands applicable to the invoking guild.
+
+    Never merge command trees from unrelated guilds: doing so leaks guild-only
+    commands into help menus in other servers. Bots without guild-scoped
+    synchronization continue to use their global local command definitions.
+    """
+    commands: list[Any] = []
+    if guild_id is not None:
         try:
-            guild_commands = bot.tree.get_commands(guild=discord.Object(id=guild.id))
+            commands = list(bot.tree.get_commands(guild=discord.Object(id=guild_id)))
         except (TypeError, AttributeError):
-            continue
-        for command in guild_commands:
-            key = (getattr(command, "name", ""), getattr(command, "type", None))
-            if key not in seen:
-                commands.append(command)
-                seen.add(key)
+            commands = []
+    if not commands:
+        commands = list(bot.tree.get_commands())
     return sorted(
         (command for command in commands if getattr(command, "name", None) != "help"),
         key=lambda item: getattr(item, "name", "").casefold(),
@@ -280,12 +280,13 @@ def _base_embed(
 class HelpCenterView(discord.ui.View):
     """Paginated, user-bound command browser."""
 
-    def __init__(self, bot: Any, owner_id: int, timeout: float = 300):
+    def __init__(self, bot: Any, owner_id: int, timeout: float = 300, guild_id: int | None = None):
         super().__init__(timeout=timeout)
         self.bot = bot
         self.owner_id = owner_id
+        self.guild_id = guild_id
         self.emojis = getattr(bot, "_help_explicit_emojis", {})
-        self.commands = _registered_commands(bot)
+        self.commands = _registered_commands(bot, guild_id=guild_id)
         self.path: list[Any] = []
         self.page = 0
         self._build()
@@ -527,7 +528,10 @@ def setup_help(
 
     async def help_callback(interaction: discord.Interaction) -> None:
         await _ensure_app_emojis(bot)
-        view = HelpCenterView(bot, interaction.user.id, timeout=timeout)
+        view = HelpCenterView(
+            bot, interaction.user.id, timeout=timeout,
+            guild_id=interaction.guild.id if interaction.guild else None,
+        )
         embed = _base_embed(bot, view.commands, page=view.page, emojis=emojis)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
         try:

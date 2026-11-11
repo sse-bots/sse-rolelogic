@@ -66,6 +66,16 @@ class RoleLogicStore:
     def get_autorole(self, guild_id: int) -> dict[str, Any] | None:
         return self.autoroles.find_one({"guild_id": str(guild_id)})
 
+    def has_autorole_config(self, guild_id: int) -> bool:
+        """True only when this guild has a non-empty saved Autorole setup."""
+        config = self.get_autorole(guild_id)
+        if not config:
+            return False
+        role_ids = config.get("role_ids", [])
+        return isinstance(role_ids, list) and any(
+            str(value).isdigit() and int(value) > 0 for value in role_ids
+        )
+
     def save_autorole(self, guild_id: int, role_ids: list[int]) -> None:
         now = utcnow()
         self.autoroles.update_one(
@@ -147,6 +157,8 @@ class RoleLogicEngine:
 
     async def reconcile_member(self, member: discord.Member) -> tuple[int, int]:
         """Apply all active logics; remove only roles this bot previously added."""
+        if member.bot:
+            return 0, 0
         guild = member.guild
         async with self._lock_for(guild.id):
             logics = await asyncio.to_thread(self.store.list_logics, guild.id)
@@ -204,12 +216,15 @@ class RoleLogicEngine:
                 try:
                     if role is not None and role_id in current_ids:
                         if guild.me is None or role >= guild.me.top_role:
+                            # Keep the tracking record: a later reconciliation can
+                            # retry if the bot's role hierarchy is corrected.
                             log.warning("Cannot remove managed role %s due to role hierarchy", role_id)
-                        else:
-                            await member.remove_roles(
-                                role, reason="SSE RoleLogic condition no longer matches"
-                            )
-                            removed += 1
+                            continue
+                        await member.remove_roles(
+                            role, reason="SSE RoleLogic condition no longer matches"
+                        )
+                        removed += 1
+                    # The role was removed, was already absent, or no longer exists.
                     await asyncio.to_thread(
                         self.store.unmark_managed, guild.id, member.id, role_id
                     )
@@ -218,6 +233,7 @@ class RoleLogicEngine:
                         role_id, member.id, guild.id,
                     )
                 except (discord.Forbidden, discord.HTTPException):
+                    # Retain tracking on API failure so the next pass can retry.
                     log.exception("Could not remove role %s from member %s", role_id, member.id)
 
             return added, removed
@@ -609,6 +625,10 @@ class WizardOperatorSelect(discord.ui.Select):
             return await interaction.response.send_message(
                 "This setup belongs to another administrator.", ephemeral=True
             )
+        if self.wizard.completed:
+            return await interaction.response.send_message(
+                "This wizard has already finished.", ephemeral=True
+            )
         self.wizard.operator = self.values[0]
         await self.wizard.refresh(interaction)
 
@@ -770,6 +790,28 @@ class RoleLogicBot(commands.Bot):
         self.store: RoleLogicStore | None = None
         self.engine: RoleLogicEngine | None = None
         self._heartbeat_started = False
+        # Consumed by the reusable activation.py module after it copies commands
+        # into each guild-specific tree.
+        self._sse_guild_command_filter = self._filter_guild_commands
+
+    async def _filter_guild_commands(self, guild: discord.Guild, tree: app_commands.CommandTree) -> None:
+        """Hide Autorole management subcommands until this guild is configured."""
+        group = tree.get_command("autorole", guild=guild)
+        if not isinstance(group, app_commands.Group):
+            return
+        configured = False
+        try:
+            configured = await asyncio.to_thread(self.store.has_autorole_config, guild.id)
+        except Exception:
+            log.exception("Could not determine Autorole setup state for guild %s", guild.id)
+        if not configured:
+            for name in ("edit", "status", "enable", "disable", "remove", "delete"):
+                group.remove_command(name)
+
+    async def sync_guild_commands(self, guild: discord.Guild) -> None:
+        syncer = getattr(self, "_sse_activation_sync_guild", None)
+        if callable(syncer):
+            await syncer(guild)
 
     async def setup_hook(self) -> None:
         if not TOKEN:
@@ -809,11 +851,13 @@ class RoleLogicBot(commands.Bot):
             daily_reconciliation.start()
 
     async def on_member_join(self, member: discord.Member) -> None:
+        if member.bot:
+            return
         # Conditional RoleLogic and Autorole are independent. Autorole roles are
         # deliberately not written to RoleLogic's managed-assignment collection.
         if self.engine:
             await self.engine.reconcile_member(member)
-        if member.bot or not self.store:
+        if not self.store:
             return
         try:
             config = await asyncio.to_thread(self.store.get_autorole, member.guild.id)
@@ -843,7 +887,7 @@ class RoleLogicBot(commands.Bot):
             log.exception("Autorole processing failed for member %s in guild %s", member.id, member.guild.id)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
-        if self.engine and {role.id for role in before.roles} != {role.id for role in after.roles}:
+        if not after.bot and self.engine and {role.id for role in before.roles} != {role.id for role in after.roles}:
             await self.engine.reconcile_member(after)
 
     async def on_guild_role_delete(self, role: discord.Role) -> None:
@@ -865,11 +909,27 @@ class RoleLogicBot(commands.Bot):
         await asyncio.to_thread(
             self.store.autoroles.update_one,
             {"guild_id": str(role.guild.id)},
-            {"$pull": {"role_ids": str(role.id)}},
+            {"$pull": {"role_ids": {"$in": [role.id, str(role.id)]}}},
         )
+        # A setup with no remaining role is not a configured Autorole.
+        await asyncio.to_thread(
+            self.store.autoroles.delete_one,
+            {"guild_id": str(role.guild.id), "role_ids": []},
+        )
+        await self.sync_guild_commands(role.guild)
         log.info("Cleaned up RoleLogic references for deleted role %s", role.id)
 
     async def close(self) -> None:
+        heartbeat_task = getattr(self, "_sse_heartbeat_task", None)
+        if heartbeat_task and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        activation_client = getattr(self, "_sse_activation_client", None)
+        if activation_client is not None:
+            activation_client.close()
         if self.mongo:
             self.mongo.close()
         await super().close()
@@ -1049,6 +1109,22 @@ async def logic_sync(interaction: discord.Interaction) -> None:
 # ---------------------------------------------------------------------------
 # Autorole: independent join-role configuration stored in MongoDB.
 # ---------------------------------------------------------------------------
+def autorole_configured():
+    """Reject stale/manual management interactions when setup is absent."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or bot.store is None:
+            raise app_commands.CheckFailure("Autorole commands can only be used inside a configured server.")
+        try:
+            configured = await asyncio.to_thread(bot.store.has_autorole_config, interaction.guild.id)
+        except PyMongoError as exc:
+            log.exception("Could not verify Autorole configuration for guild %s", interaction.guild.id)
+            raise app_commands.CheckFailure("Autorole configuration could not be checked. Please try again.") from exc
+        if not configured:
+            raise app_commands.CheckFailure("Autorole is not set up in this server. Use `/autorole setup` first.")
+        return True
+    return app_commands.check(predicate)
+
+
 autorole_group = app_commands.Group(
     name="autorole",
     description="Automatically assign selected roles to new human members",
@@ -1065,6 +1141,7 @@ class AutorolePicker(discord.ui.View):
         self.selected = set(selected or set())
         self.page = 0
         self.message: discord.InteractionMessage | None = None
+        self.saving = False
         self._build()
 
     def _roles(self) -> list[discord.Role]:
@@ -1130,6 +1207,15 @@ class AutorolePicker(discord.ui.View):
         self._build()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(content="This Autorole setup expired. Run `/autorole setup` again.", embed=None, view=self)
+            except discord.HTTPException:
+                log.debug("Could not update expired Autorole picker for guild %s", self.guild.id)
+
 
 class AutoroleRoleSelect(discord.ui.Select):
     def __init__(self, options: list[discord.SelectOption], parent: AutorolePicker):
@@ -1172,6 +1258,9 @@ class AutoroleSaveButton(discord.ui.Button):
         self.parent = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if self.parent.saving:
+            await interaction.response.send_message("Autorole is already being saved. Please wait.", ephemeral=True)
+            return
         if not self.parent.selected:
             await interaction.response.send_message("Select at least one role before saving.", ephemeral=True)
             return
@@ -1184,18 +1273,29 @@ class AutoroleSaveButton(discord.ui.Button):
                 ephemeral=True,
             )
             return
+        self.parent.saving = True
+        await interaction.response.defer()
         try:
             await asyncio.to_thread(bot.store.save_autorole, self.parent.guild.id, sorted(self.parent.selected))
         except PyMongoError:
+            self.parent.saving = False
             log.exception("Failed to save Autorole configuration for guild %s", self.parent.guild.id)
-            await interaction.response.send_message("I couldn't save Autorole right now. Please try again.", ephemeral=True)
+            await interaction.followup.send("I couldn't save Autorole right now. Please try again.", ephemeral=True)
             return
         self.parent.stop()
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"✅ Autorole enabled. **{len(self.parent.selected)}** role(s) will be assigned to new human members.",
             embed=None,
             view=None,
         )
+        try:
+            await bot.sync_guild_commands(self.parent.guild)
+        except Exception:
+            log.exception("Autorole saved but command synchronization failed for guild %s", self.parent.guild.id)
+            await interaction.followup.send(
+                "Autorole was saved, but Discord command visibility could not be refreshed. It will be retried when the bot reconnects.",
+                ephemeral=True,
+            )
 
 
 class AutoroleCancelButton(discord.ui.Button):
@@ -1217,6 +1317,10 @@ async def _open_autorole_picker(interaction: discord.Interaction, existing: dict
                 continue
     view = AutorolePicker(interaction.guild, interaction.user.id, selected)
     await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        log.debug("Could not cache Autorole picker message for guild %s", interaction.guild.id)
 
 
 @autorole_group.command(name="setup", description="Set up roles to assign when new members join.")
@@ -1228,6 +1332,7 @@ async def autorole_setup(interaction: discord.Interaction) -> None:
 
 @autorole_group.command(name="edit", description="Edit the roles assigned to new members.")
 @admin_only()
+@autorole_configured()
 async def autorole_edit(interaction: discord.Interaction) -> None:
     existing = await asyncio.to_thread(bot.store.get_autorole, interaction.guild.id)
     if not existing:
@@ -1238,6 +1343,7 @@ async def autorole_edit(interaction: discord.Interaction) -> None:
 
 @autorole_group.command(name="status", description="View this server's Autorole configuration.")
 @admin_only()
+@autorole_configured()
 async def autorole_status(interaction: discord.Interaction) -> None:
     config = await asyncio.to_thread(bot.store.get_autorole, interaction.guild.id)
     if not config:
@@ -1265,6 +1371,7 @@ async def autorole_status(interaction: discord.Interaction) -> None:
 
 @autorole_group.command(name="enable", description="Enable configured Autorole assignments.")
 @admin_only()
+@autorole_configured()
 async def autorole_enable(interaction: discord.Interaction) -> None:
     result = await asyncio.to_thread(
         bot.store.autoroles.update_one,
@@ -1279,6 +1386,7 @@ async def autorole_enable(interaction: discord.Interaction) -> None:
 
 @autorole_group.command(name="disable", description="Temporarily disable Autorole without deleting its settings.")
 @admin_only()
+@autorole_configured()
 async def autorole_disable(interaction: discord.Interaction) -> None:
     result = await asyncio.to_thread(
         bot.store.autoroles.update_one,
@@ -1293,6 +1401,7 @@ async def autorole_disable(interaction: discord.Interaction) -> None:
 
 @autorole_group.command(name="remove", description="Permanently remove this server's Autorole configuration.")
 @admin_only()
+@autorole_configured()
 async def autorole_remove(interaction: discord.Interaction) -> None:
     result = await asyncio.to_thread(
         bot.store.autoroles.delete_one,
@@ -1302,6 +1411,24 @@ async def autorole_remove(interaction: discord.Interaction) -> None:
         "Autorole configuration removed. Existing member roles have been left unchanged." if result.deleted_count else "Autorole is not configured.",
         ephemeral=True,
     )
+    if result.deleted_count:
+        await bot.sync_guild_commands(interaction.guild)
+
+
+@autorole_group.command(name="delete", description="Delete this server's Autorole configuration.")
+@admin_only()
+@autorole_configured()
+async def autorole_delete(interaction: discord.Interaction) -> None:
+    result = await asyncio.to_thread(
+        bot.store.autoroles.delete_one,
+        {"guild_id": str(interaction.guild.id)},
+    )
+    await interaction.response.send_message(
+        "Autorole configuration deleted. Existing member roles have been left unchanged." if result.deleted_count else "Autorole is not configured.",
+        ephemeral=True,
+    )
+    if result.deleted_count:
+        await bot.sync_guild_commands(interaction.guild)
 
 
 @tasks.loop(hours=24)

@@ -311,6 +311,15 @@ async def setup_activation(bot: discord.Client) -> ActivationService:
             elif command.name not in allowed:
                 tree.remove_command(command.name, guild=guild)
 
+        # Bot-specific extensions may filter nested commands after the shared
+        # activation filter has built this guild's command tree. The callback
+        # must only mutate this guild's copied command objects.
+        guild_filter = getattr(bot, "_sse_guild_command_filter", None)
+        if callable(guild_filter):
+            result = guild_filter(guild, tree)
+            if asyncio.iscoroutine(result):
+                await result
+
         await tree.sync(guild=guild)
 
         log.info(

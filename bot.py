@@ -23,6 +23,7 @@ from sse_bot_core.activation import setup_activation, _configure_srv_dns
 from sse_bot_core.help_menu import setup_help
 from sse_bot_core.heartbeat_client import start_heartbeat
 from sse_bot_core.keep_alive import keep_alive
+from sse_bot_core.runtime_retry import retry_runtime_lease
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -839,7 +840,7 @@ class RoleLogicBot(commands.Bot):
         setup_help(self)
 
         # setup_activation owns global/guild command synchronization.
-        await setup_activation(self)
+        await retry_runtime_lease(setup_activation, self, logger=log)
         log.info("RoleLogic database and SSE activation initialized.")
 
     async def on_ready(self) -> None:

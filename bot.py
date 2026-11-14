@@ -19,10 +19,10 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-from activation import setup_activation, _configure_srv_dns
-from help_menu import setup_help
-from heartbeat_client import start_heartbeat
-from keep_alive import keep_alive
+from sse_bot_core.activation import setup_activation, _configure_srv_dns
+from sse_bot_core.help_menu import setup_help
+from sse_bot_core.heartbeat_client import start_heartbeat
+from sse_bot_core.keep_alive import keep_alive
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -799,6 +799,9 @@ class RoleLogicBot(commands.Bot):
         group = tree.get_command("autorole", guild=guild)
         if not isinstance(group, app_commands.Group):
             return
+        if self.store is None:
+            log.warning("Autorole command filtering skipped: database store is not ready.")
+            return
         configured = False
         try:
             configured = await asyncio.to_thread(self.store.has_autorole_config, guild.id)
@@ -920,6 +923,9 @@ class RoleLogicBot(commands.Bot):
         log.info("Cleaned up RoleLogic references for deleted role %s", role.id)
 
     async def close(self) -> None:
+        if daily_reconciliation.is_running():
+            daily_reconciliation.cancel()
+
         heartbeat_task = getattr(self, "_sse_heartbeat_task", None)
         if heartbeat_task and not heartbeat_task.done():
             heartbeat_task.cancel()
@@ -1451,7 +1457,10 @@ async def on_app_command_error(
     if isinstance(error, app_commands.CheckFailure):
         message = str(error) or "You don't have permission to use this command."
     else:
-        log.exception("Slash command failed", exc_info=error)
+        log.error(
+            "Slash command failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
         message = "Something went wrong while running that command. The error has been logged."
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
@@ -1460,6 +1469,9 @@ async def on_app_command_error(
 
 
 def main() -> None:
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is missing. Add it to your environment or .env file.")
+
     keep_alive()
     bot.run(TOKEN)
 
